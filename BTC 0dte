@@ -1,0 +1,123 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, time
+
+class BTCZeroDTEStraddle:
+    def __init__(self):
+        self.strategy_name = "BTC 0DTE Straddle"
+        self.ticker = "BTCUSD"
+        
+        # Strategy parameters
+        self.entry_time = time(16, 6)  # 16:06
+        self.exit_time = time(17, 29)  # 17:29
+        self.quantity = 100
+        self.overall_sl = 4000  # MTM stop loss
+        self.leg_sl_percent = 100
+        self.leg_target_percent = 100
+        self.max_positions_per_day = 1
+        
+        # Position tracking
+        self.position_active = False
+        self.entry_price = None
+        self.ce_entry_price = None
+        self.pe_entry_price = None
+        self.positions_today = 0
+        self.current_date = None
+        
+    def reset_daily_counters(self, current_datetime):
+        """Reset position counters for new trading day"""
+        if self.current_date != current_datetime.date():
+            self.positions_today = 0
+            self.current_date = current_datetime.date()
+    
+    def check_entry_time(self, current_datetime):
+        """Check if current time matches entry time"""
+        current_time = current_datetime.time()
+        return (current_time.hour == self.entry_time.hour and 
+                current_time.minute == self.entry_time.minute)
+    
+    def check_exit_time(self, current_datetime):
+        """Check if current time matches exit time"""
+        current_time = current_datetime.time()
+        return (current_time.hour >= self.exit_time.hour and 
+                current_time.minute >= self.exit_time.minute)
+    
+    def calculate_pnl(self, current_price):
+        """Calculate current P&L (simplified for straddle)"""
+        if not self.position_active or self.entry_price is None:
+            return 0
+        
+        # Simplified straddle P&L calculation
+        # Actual straddle would need separate CE/PE prices
+        price_move = abs(current_price - self.entry_price)
+        
+        # Straddle profits from volatility, loses from time decay
+        # This is a simplified calculation
+        straddle_value = max(0, price_move - (current_price * 0.02))  # Simplified
+        return (straddle_value - (self.quantity * 2)) * -1  # Short position
+    
+    def process_tick(self, timestamp, price):
+        """Process each price tick"""
+        current_datetime = pd.to_datetime(timestamp)
+        self.reset_daily_counters(current_datetime)
+        
+        signals = {
+            'timestamp': timestamp,
+            'price': price,
+            'action': 'HOLD',
+            'quantity': 0,
+            'pnl': 0,
+            'position_active': self.position_active
+        }
+        
+        # Entry logic
+        if (not self.position_active and 
+            self.positions_today < self.max_positions_per_day and
+            self.check_entry_time(current_datetime)):
+            
+            # Enter short straddle position
+            self.position_active = True
+            self.entry_price = price
+            self.ce_entry_price = price  # Simplified - would be ATM CE price
+            self.pe_entry_price = price  # Simplified - would be ATM PE price
+            self.positions_today += 1
+            
+            signals['action'] = 'SELL_STRADDLE'
+            signals['quantity'] = self.quantity * 2  # CE + PE
+        
+        # Exit logic
+        elif self.position_active:
+            current_pnl = self.calculate_pnl(price)
+            
+            # Time-based exit
+            if self.check_exit_time(current_datetime):
+                self.position_active = False
+                self.entry_price = None
+                signals['action'] = 'COVER_STRADDLE'
+                signals['quantity'] = self.quantity * 2
+                signals['pnl'] = current_pnl
+            
+            # Stop loss exit
+            elif current_pnl <= -self.overall_sl:
+                self.position_active = False
+                self.entry_price = None
+                signals['action'] = 'STOP_LOSS'
+                signals['quantity'] = self.quantity * 2
+                signals['pnl'] = current_pnl
+            
+            else:
+                signals['pnl'] = current_pnl
+        
+        return signals
+    
+    def backtest(self, price_data):
+        """Run backtest on price data"""
+        results = []
+        
+        for _, row in price_data.iterrows():
+            signal = self.process_tick(row['timestamp'], row['price'])
+            results.append(signal)
+        
+        return pd.DataFrame(results)
+
+)
