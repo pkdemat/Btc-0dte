@@ -1,0 +1,470 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, time, timedelta
+import yfinance as yf
+from typing import Dict, List, Optional, Tuple
+import warnings
+warnings.filterwarnings('ignore')
+
+class FinNiftyBuyingStrategy:
+    def __init__(self):
+        # Strategy Configuration
+        self.name = "FinNifty Buying Strategy (Long Straddle)"
+        self.version = "0.7"
+        self.ticker = "FINNIFTY"  # FinNifty index
+        self.template = "Straddle920"
+        
+        # Time Settings
+        self.entry_time = time(9, 16)   # 9:16 AM
+        self.exit_time = time(15, 25)   # 3:25 PM
+        
+        # Position Management
+        self.max_positions_per_day = 1
+        self.strategy_type = "IntradaySameDay"
+        self.skip_initial_candles = 0
+        
+        # Overall Risk Management
+        self.overall_sl_mtm = 6000  # ₹6000 MTM Stop Loss
+        self.overall_trail_instrument_move = 100  # Points
+        self.overall_trail_sl_move = 50  # Points
+        self.lock_and_trail_profit = 1000  # Points
+        self.lock_and_trail_sl = 500  # Points
+        
+        # Leg Configuration (Both Call and Put have same parameters)
+        self.leg_configs = {
+            'call': {
+                'instrument_kind': 'CE',
+                'position_type': 'Buy',  # Long position
+                'strike_parameter': 'ATM',  # At-The-Money
+                'expiry_kind': 'Monthly',
+                'quantity': 3,  # 3 lots
+                'momentum_required': 12,  # 12 points up movement
+                'stop_loss_points': 5,  # ₹5 points stop loss
+                'target_premium_percent': 200,  # 200% premium profit
+                'trail_instrument_move': 2,  # 2 points move
+                'trail_sl_move': 2,  # 2 points SL move
+                'reentry_sl_count': 6,  # Like Original reentry
+                'reentry_tp_count': 0   # No target reentry
+            },
+            'put': {
+                'instrument_kind': 'PE',
+                'position_type': 'Buy',
+                'strike_parameter': 'ATM',
+                'expiry_kind': 'Monthly',
+                'quantity': 3,
+                'momentum_required': 12,
+                'stop_loss_points': 5,
+                'target_premium_percent': 200,
+                'trail_instrument_move': 2,
+                'trail_sl_move': 2,
+                'reentry_sl_count': 6,
+                'reentry_tp_count': 0
+            }
+        }
+        
+        # Strategy State
+        self.position_open = False
+        self.positions_today = 0
+        self.entry_price = None
+        self.call_position = None
+        self.put_position = None
+        self.current_pnl = 0
+        self.max_profit_today = 0
+        self.last_trade_date = None
+        self.trail_sl_price = None
+        self.locked_profit = False
+        self.entry_momentum_price = None
+        self.reentry_counts = {
+            'call_sl': 0, 'put_sl': 0
+        }
+    
+    def get_market_data(self, period: str = "10d", interval: str = "1m") -> Optional[pd.DataFrame]:
+        """Fetch FinNifty data - using Nifty Bank as proxy since FinNifty may not be available on Yahoo Finance"""
+        try:
+            # Using Nifty Bank as proxy for FinNifty
+            ticker = yf.Ticker("^NSEBANK")
+            data = ticker.history(period=period, interval=interval)
+            
+            if not data.empty:
+                # Calculate momentum (points movement from recent low)
+                data['Points_From_Low'] = 0.0
+                data['Momentum_Satisfied'] = False
+                
+                # Calculate rolling momentum
+                for i in range(10, len(data)):
+                    recent_low = data['Low'].iloc[max(0, i-10):i].min()
+                    current_price = data['Close'].iloc[i]
+                    points_from_low = current_price - recent_low
+                    data.at[data.index[i], 'Points_From_Low'] = points_from_low
+                    data.at[data.index[i], 'Momentum_Satisfied'] = points_from_low >= 12
+                
+            return data
+        except Exception as e:
+            print(f"Error fetching FinNifty data (using Bank Nifty as proxy): {e}")
+            return None
+    
+    def calculate_option_premium(self, spot_price: float, strike_price: float, option_type: str, volatility: float = 0.25) -> float:
+        """Simplified option premium calculation for FinNifty options"""
+        if option_type.upper() == 'CE':  # Call option
+            intrinsic_value = max(0, spot_price - strike_price)
+            time_value = spot_price * volatility * 0.08  # Higher time value for FinNifty
+        else:  # Put option
+            intrinsic_value = max(0, strike_price - spot_price)
+            time_value = spot_price * volatility * 0.08
+        
+        return intrinsic_value + time_value
+    
+    def get_atm_strike_prices(self, spot_price: float) -> Dict[str, float]:
+        """Get ATM strike prices for both call and put"""
+        # Round spot price to nearest 50 for FinNifty options (typical)
+        atm_strike = round(spot_price / 50) * 50
+        
+        return {
+            'call_strike': atm_strike,
+            'put_strike': atm_strike
+        }
+    
+    def check_momentum_condition(self, current_data: pd.Series, lookback_data: pd.DataFrame) -> bool:
+        """Check if momentum condition is satisfied (12 points up movement)"""
+        if len(lookback_data) < 10:
+            return False
+        
+        # Check if current data has momentum satisfied flag
+        if 'Momentum_Satisfied' in current_data:
+            return current_data['Momentum_Satisfied']
+        
+        # Fallback calculation
+        recent_low = lookback_data['Low'].tail(10).min()
+        current_price = current_data['Close']
+        points_from_low = current_price - recent_low
+        
+        return points_from_low >= self.leg_configs['call']['momentum_required']
+    
+    def check_entry_conditions(self, current_time: datetime, current_data: pd.Series, lookback_data: pd.DataFrame) -> bool:
+        """Check if all entry conditions are met"""
+        # Time condition
+        if current_time.time() < self.entry_time:
+            return False
+        
+        # Position limits
+        if (self.positions_today >= self.max_positions_per_day or 
+            self.position_open):
+            return False
+        
+        # Date check
+        if (self.last_trade_date and 
+            current_time.date() == self.last_trade_date):
+            return False
+        
+        # Momentum condition (12 points up movement required)
+        if not self.check_momentum_condition(current_data, lookback_data):
+            return False
+        
+        return True
+    
+    def check_exit_conditions(self, current_time: datetime, current_data: pd.Series) -> Tuple[bool, str]:
+        """Check if exit conditions are met"""
+        if not self.position_open:
+            return False, "No Position"
+        
+        # Time-based exit
+        if current_time.time() >= self.exit_time:
+            return True, "Time Exit"
+        
+        # Overall MTM stop loss
+        if self.current_pnl <= -self.overall_sl_mtm:
+            return True, "Overall SL Hit"
+        
+        # Individual leg stop losses (₹5 points each)
+        call_sl_hit = False
+        put_sl_hit = False
+        
+        if self.call_position:
+            call_loss = self.call_position['entry_premium'] - self.call_position['current_premium']
+            if call_loss >= self.leg_configs['call']['stop_loss_points']:
+                call_sl_hit = True
+        
+        if self.put_position:
+            put_loss = self.put_position['entry_premium'] - self.put_position['current_premium']
+            if put_loss >= self.leg_configs['put']['stop_loss_points']:
+                put_sl_hit = True
+        
+        # Check if both legs hit SL and reentries exhausted
+        if call_sl_hit and put_sl_hit:
+            if (self.reentry_counts['call_sl'] >= self.leg_configs['call']['reentry_sl_count'] and
+                self.reentry_counts['put_sl'] >= self.leg_configs['put']['reentry_sl_count']):
+                return True, "Both Legs SL Exhausted"
+        
+        # Individual leg targets (200% profit)
+        call_target_hit = False
+        put_target_hit = False
+        
+        if self.call_position:
+            call_profit_percent = ((self.call_position['current_premium'] - self.call_position['entry_premium']) / 
+                                 self.call_position['entry_premium']) * 100
+            if call_profit_percent >= self.leg_configs['call']['target_premium_percent']:
+                call_target_hit = True
+        
+        if self.put_position:
+            put_profit_percent = ((self.put_position['current_premium'] - self.put_position['entry_premium']) / 
+                                self.put_position['entry_premium']) * 100
+            if put_profit_percent >= self.leg_configs['put']['target_premium_percent']:
+                put_target_hit = True
+        
+        # Exit if both legs hit target (no target reentry configured)
+        if call_target_hit and put_target_hit:
+            return True, "Both Legs Target Achieved"
+        
+        # Overall trailing stop loss
+        if self.trail_sl_price and current_data['Close'] <= self.trail_sl_price:
+            return True, "Trail SL Hit"
+        
+        return False, "Hold"
+    
+    def enter_position(self, current_data: pd.Series, current_time: datetime):
+        """Enter long straddle position with ATM strikes"""
+        spot_price = current_data['Close']
+        strikes = self.get_atm_strike_prices(spot_price)
+        
+        # Calculate option premiums
+        call_premium = self.calculate_option_premium(spot_price, strikes['call_strike'], 'CE')
+        put_premium = self.calculate_option_premium(spot_price, strikes['put_strike'], 'PE')
+        
+        # Create positions (Long straddle)
+        self.call_position = {
+            'strike': strikes['call_strike'],
+            'entry_premium': call_premium,
+            'current_premium': call_premium,
+            'quantity': self.leg_configs['call']['quantity'],
+            'entry_time': current_time,
+            'position_type': 'Long',
+            'trail_sl': call_premium - self.leg_configs['call']['stop_loss_points']
+        }
+        
+        self.put_position = {
+            'strike': strikes['put_strike'],
+            'entry_premium': put_premium,
+            'current_premium': put_premium,
+            'quantity': self.leg_configs['put']['quantity'],
+            'entry_time': current_time,
+            'position_type': 'Long',
+            'trail_sl': put_premium - self.leg_configs['put']['stop_loss_points']
+        }
+        
+        self.entry_price = spot_price
+        self.entry_momentum_price = spot_price  # Store price when momentum was satisfied
+        self.position_open = True
+        self.positions_today += 1
+        self.last_trade_date = current_time.date()
+        self.reentry_counts = {'call_sl': 0, 'put_sl': 0}
+        
+        total_premium_paid = (call_premium + put_premium) * 3  # 3 lots each
+        
+        print(f"\n=== ENTRY at {current_time} ===")
+        print(f"Spot Price: {spot_price:.2f}")
+        print(f"Momentum Satisfied: 12+ points up movement detected")
+        print(f"Call ATM Strike: {strikes['call_strike']:.0f}, Premium: ₹{call_premium:.2f}")
+        print(f"Put ATM Strike: {strikes['put_strike']:.0f}, Premium: ₹{put_premium:.2f}")
+        print(f"Total Premium Paid: ₹{total_premium_paid:.2f}")
+        print(f"Individual Leg SL: ₹{self.leg_configs['call']['stop_loss_points']}")
+    
+    def update_positions(self, current_data: pd.Series):
+        """Update current option premiums and PnL"""
+        if not self.position_open:
+            return
+        
+        spot_price = current_data['Close']
+        
+        # Update call position
+        if self.call_position:
+            new_call_premium = self.calculate_option_premium(
+                spot_price, self.call_position['strike'], 'CE'
+            )
+            self.call_position['current_premium'] = new_call_premium
+            
+            # Update trailing SL for call (2 points move -> 2 points SL move)
+            premium_move = new_call_premium - self.call_position['entry_premium']
+            if premium_move >= self.leg_configs['call']['trail_instrument_move']:
+                self.call_position['trail_sl'] = new_call_premium - self.leg_configs['call']['trail_sl_move']
+        
+        # Update put position
+        if self.put_position:
+            new_put_premium = self.calculate_option_premium(
+                spot_price, self.put_position['strike'], 'PE'
+            )
+            self.put_position['current_premium'] = new_put_premium
+            
+            # Update trailing SL for put
+            premium_move = new_put_premium - self.put_position['entry_premium']
+            if premium_move >= self.leg_configs['put']['trail_instrument_move']:
+                self.put_position['trail_sl'] = new_put_premium - self.leg_configs['put']['trail_sl_move']
+        
+        # Calculate total PnL (Long straddle - profit when premiums increase)
+        call_pnl = 0
+        put_pnl = 0
+        
+        if self.call_position:
+            call_pnl = (self.call_position['current_premium'] - self.call_position['entry_premium']) * self.call_position['quantity']
+        
+        if self.put_position:
+            put_pnl = (self.put_position['current_premium'] - self.put_position['entry_premium']) * self.put_position['quantity']
+        
+        self.current_pnl = call_pnl + put_pnl
+        
+        # Update maximum profit for overall trailing
+        if self.current_pnl > self.max_profit_today:
+            self.max_profit_today = self.current_pnl
+            
+            # Overall trailing stop loss (100 points move -> 50 points SL move)
+            price_move = abs(spot_price - self.entry_price)
+            if price_move >= self.overall_trail_instrument_move:
+                self.trail_sl_price = spot_price - self.overall_trail_sl_move
+            
+            # Lock and trail logic (1000 points profit -> 500 points trail)
+            if self.current_pnl >= self.lock_and_trail_profit and not self.locked_profit:
+                self.locked_profit = True
+                self.trail_sl_price = spot_price - self.lock_and_trail_sl
+                print(f"Profit locked at ₹{self.current_pnl:.2f}, Trail SL set at {self.trail_sl_price:.2f}")
+    
+    def handle_reentry(self, leg_type: str, current_data: pd.Series, current_time: datetime):
+        """Handle reentry logic for individual legs after SL hit"""
+        config = self.leg_configs[leg_type]
+        reentry_key = f"{leg_type}_sl"
+        
+        if self.reentry_counts[reentry_key] < config['reentry_sl_count']:
+            # Like Original reentry - enter at same strike and similar conditions
+            self.reentry_counts[reentry_key] += 1
+            spot_price = current_data['Close']
+            strikes = self.get_atm_strike_prices(spot_price)
+            
+            strike_key = 'call_strike' if leg_type == 'call' else 'put_strike'
+            new_premium = self.calculate_option_premium(
+                spot_price, strikes[strike_key], config['instrument_kind']
+            )
+            
+            if leg_type == 'call':
+                self.call_position = {
+                    'strike': strikes[strike_key],
+                    'entry_premium': new_premium,
+                    'current_premium': new_premium,
+                    'quantity': config['quantity'],
+                    'entry_time': current_time,
+                    'position_type': 'Long',
+                    'trail_sl': new_premium - config['stop_loss_points']
+                }
+            else:
+                self.put_position = {
+                    'strike': strikes[strike_key],
+                    'entry_premium': new_premium,
+                    'current_premium': new_premium,
+                    'quantity': config['quantity'],
+                    'entry_time': current_time,
+                    'position_type': 'Long',
+                    'trail_sl': new_premium - config['stop_loss_points']
+                }
+            
+            print(f"REENTRY: {leg_type.title()} leg re-entered at ₹{new_premium:.2f} (SL Reentry #{self.reentry_counts[reentry_key]})")
+    
+    def exit_position(self, current_data: pd.Series, current_time: datetime, exit_reason: str):
+        """Exit all positions"""
+        if not self.position_open:
+            return
+        
+        self.update_positions(current_data)
+        final_pnl = self.current_pnl
+        
+        print(f"\n=== EXIT at {current_time} ===")
+        print(f"Exit Reason: {exit_reason}")
+        print(f"Spot Price: {current_data['Close']:.2f}")
+        
+        if self.call_position:
+            call_pnl = (self.call_position['current_premium'] - self.call_position['entry_premium']) * self.call_position['quantity']
+            call_pnl_percent = ((self.call_position['current_premium'] - self.call_position['entry_premium']) / 
+                              self.call_position['entry_premium']) * 100
+            print(f"Call PnL: ₹{call_pnl:.2f} ({call_pnl_percent:.1f}%)")
+        
+        if self.put_position:
+            put_pnl = (self.put_position['current_premium'] - self.put_position['entry_premium']) * self.put_position['quantity']
+            put_pnl_percent = ((self.put_position['current_premium'] - self.put_position['entry_premium']) / 
+                             self.put_position['entry_premium']) * 100
+            print(f"Put PnL: ₹{put_pnl:.2f} ({put_pnl_percent:.1f}%)")
+        
+        print(f"Total PnL: ₹{final_pnl:.2f}")
+        print(f"Reentry Counts: {self.reentry_counts}")
+        
+        # Reset position state
+        self.position_open = False
+        self.call_position = None
+        self.put_position = None
+        self.current_pnl = 0
+        self.entry_price = None
+        self.trail_sl_price = None
+        self.locked_profit = False
+        self.max_profit_today = 0
+        self.entry_momentum_price = None
+    
+    def run_backtest(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Run the strategy backtest on historical data"""
+        results = []
+        
+        for i, (index, row) in enumerate(data.iterrows()):
+            current_time = index
+            current_data = row
+            current_date = current_time.date()
+            
+            # Get lookback data for momentum calculation
+            lookback_data = data.iloc[max(0, i-20):i+1]
+            
+            # Reset daily counters
+            if (self.last_trade_date and 
+                current_date != self.last_trade_date and 
+                current_date.weekday() < 5):  # Weekday check
+                self.positions_today = 0
+                self.max_profit_today = 0
+            
+            # Check entry conditions
+            if self.check_entry_conditions(current_time, current_data, lookback_data):
+                self.enter_position(current_data, current_time)
+            
+            # Update positions if open
+            if self.position_open:
+                self.update_positions(current_data)
+                
+                # Check for individual leg reentries
+                if self.call_position:
+                    call_loss = self.call_position['entry_premium'] - self.call_position['current_premium']
+                    if (call_loss >= self.leg_configs['call']['stop_loss_points'] and 
+                        self.reentry_counts['call_sl'] < self.leg_configs['call']['reentry_sl_count']):
+                        self.handle_reentry('call', current_data, current_time)
+                
+                if self.put_position:
+                    put_loss = self.put_position['entry_premium'] - self.put_position['current_premium']
+                    if (put_loss >= self.leg_configs['put']['stop_loss_points'] and 
+                        self.reentry_counts['put_sl'] < self.leg_configs['put']['reentry_sl_count']):
+                        self.handle_reentry('put', current_data, current_time)
+                
+                # Check overall exit conditions
+                should_exit, exit_reason = self.check_exit_conditions(current_time, current_data)
+                if should_exit:
+                    self.exit_position(current_data, current_time, exit_reason)
+            
+            # Record results
+            momentum_satisfied = current_data.get('Momentum_Satisfied', False)
+            points_from_low = current_data.get('Points_From_Low', 0)
+            
+            results.append({
+                'timestamp': current_time,
+                'spot_price': current_data['Close'],
+                'momentum_satisfied': momentum_satisfied,
+                'points_from_low': points_from_low,
+                'position_open': self.position_open,
+                'current_pnl': self.current_pnl,
+                'max_profit_today': self.max_profit_today,
+                'trail_sl_price': self.trail_sl_price,
+                'call_position': bool(self.call_position),
+                'put_position': bool(self.put_position),
+                'call_reentry_count': self.reentry_counts.get('call_sl', 0),
+                'put_reentry_count': self.reentry_counts.get('put_sl', 0)
+            })
+        
+        return pd.DataFrame(results)
