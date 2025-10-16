@@ -1,0 +1,126 @@
+//@version=5
+strategy("Moderate Volume Strategy", shorttitle="MVS", overlay=true, default_qty_type=strategy.fixed, default_qty_value=100, initial_capital=100000, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ==================== INPUTS ====================
+
+ma_length = input.int(21, "Volume MA Length", minval=1)
+st_length = input.int(10, "SuperTrend Length", minval=1)
+st_factor = input.float(3.0, "SuperTrend Factor", minval=0.1, step=0.1)
+rsi_length = input.int(14, "RSI Length", minval=1)
+rsi_buy = input.int(40, "RSI Buy Threshold", minval=0, maxval=100)
+rsi_sell = input.int(60, "RSI Sell Threshold", minval=0, maxval=100)
+vol_mult = input.float(1.15, "Volume Multiplier", minval=1.0, step=0.05)
+vol_spike = input.float(1.1, "Volume Spike Threshold", minval=1.0, step=0.05)
+sl_mult = input.float(1.5, "Stop Loss ATR Multiplier", minval=0.5, step=0.1)
+pl_trigger = input.float(4.0, "Profit Lock Trigger", minval=2.0, step=0.5)
+pl_level = input.float(3.0, "Profit Lock Level", minval=1.0, step=0.5)
+
+// ==================== CALCULATIONS ====================
+
+vwap_val = ta.vwap(hlc3)
+vol_ma = ta.sma(volume, ma_length)
+buy_vol = close > open ? volume : 0.0
+sell_vol = close < open ? volume : 0.0
+buy_vol_ma = ta.sma(buy_vol, ma_length)
+sell_vol_ma = ta.sma(sell_vol, ma_length)
+vol_spike_ratio = volume / vol_ma
+rsi_val = ta.rsi(close, rsi_length)
+atr_val = ta.atr(st_length)
+up_band = hl2 + st_factor * atr_val
+dn_band = hl2 - st_factor * atr_val
+
+var float st = na
+var bool is_up = true
+
+if na(st[1])
+    st := dn_band
+    is_up := true
+else
+    if is_up[1]
+        dn_band := math.max(dn_band, st[1])
+        st := close <= dn_band ? up_band : dn_band
+        is_up := close > dn_band
+    else
+        up_band := math.min(up_band, st[1])
+        st := close >= up_band ? dn_band : up_band
+        is_up := close >= up_band
+
+// ==================== SIGNALS ====================
+
+long_cond = close > vwap_val and buy_vol > buy_vol_ma * vol_mult and is_up and rsi_val > rsi_buy and vol_spike_ratio > vol_spike
+short_cond = close < vwap_val and sell_vol > sell_vol_ma * vol_mult and not is_up and rsi_val < rsi_sell and vol_spike_ratio > vol_spike
+long_signal = long_cond and not long_cond[1]
+short_signal = short_cond and not short_cond[1]
+
+// ==================== STRATEGY LOGIC ====================
+
+var float entry_atr = na
+var float max_profit = 0.0
+
+if long_signal and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close("Short")
+    strategy.entry("Long", strategy.long)
+    entry_atr := atr_val
+    max_profit := 0.0
+
+if short_signal and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close("Long")
+    strategy.entry("Short", strategy.short)
+    entry_atr := atr_val
+    max_profit := 0.0
+
+if strategy.position_size > 0 and not na(entry_atr)
+    sl_price = strategy.position_avg_price - sl_mult * entry_atr
+    pl_trigger_amt = pl_trigger * entry_atr * 100
+    pl_price = strategy.position_avg_price + pl_level * entry_atr
+    curr_profit = (close - strategy.position_avg_price) * 100
+    if curr_profit > max_profit
+        max_profit := curr_profit
+    if close <= sl_price
+        strategy.close("Long", comment="SL")
+        entry_atr := na
+        max_profit := 0.0
+    else if not is_up
+        strategy.close("Long", comment="ST")
+        entry_atr := na
+        max_profit := 0.0
+    else if max_profit > pl_trigger_amt and close < pl_price
+        strategy.close("Long", comment="PL")
+        entry_atr := na
+        max_profit := 0.0
+
+if strategy.position_size < 0 and not na(entry_atr)
+    sl_price = strategy.position_avg_price + sl_mult * entry_atr
+    pl_trigger_amt = pl_trigger * entry_atr * 100
+    pl_price = strategy.position_avg_price - pl_level * entry_atr
+    curr_profit = (strategy.position_avg_price - close) * 100
+    if curr_profit > max_profit
+        max_profit := curr_profit
+    if close >= sl_price
+        strategy.close("Short", comment="SL")
+        entry_atr := na
+        max_profit := 0.0
+    else if is_up
+        strategy.close("Short", comment="ST")
+        entry_atr := na
+        max_profit := 0.0
+    else if max_profit > pl_trigger_amt and close > pl_price
+        strategy.close("Short", comment="PL")
+        entry_atr := na
+        max_profit := 0.0
+
+// ==================== PLOTTING ====================
+
+plot(vwap_val, "VWAP", color=color.blue, linewidth=2)
+st_color = is_up ? color.green : color.red
+plot(st, "SuperTrend", color=st_color, linewidth=2)
+plotshape(long_signal, "Buy", shape.labelup, location.belowbar, color=color.new(color.green, 0), text="BUY", textcolor=color.white)
+plotshape(short_signal, "Sell", shape.labeldown, location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white)
+bgcolor(long_signal ? color.new(color.green, 90) : short_signal ? color.new(color.red, 90) : na)
+
+// ==================== ALERTS ====================
+
+alertcondition(long_signal, "Buy Alert", "BUY Signal")
+alertcondition(short_signal, "Sell Alert", "SELL Signal")
